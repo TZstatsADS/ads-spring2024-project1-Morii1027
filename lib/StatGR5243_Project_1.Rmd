@@ -1,0 +1,356 @@
+---
+title: "Stat GR5243 Project 1"
+author: 'Yanzhao Chen'
+output:
+  html_document:
+    df_print: paged
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+HappyDB is a corpus of 100,000 crowd-sourced happy moments via Amazon's Mechanical Turk. You can read more about it on https://arxiv.org/abs/1801.07746
+
+In this R notebook, we process the raw textual data for our data analysis.
+
+### Step 0 - Load all the required libraries
+
+From the packages' descriptions:
+
++ `tm` is a framework for text mining applications within R;
++ `tidyverse` is an opinionated collection of R packages designed for data science. All packages share an underlying design philosophy, grammar, and data structures;
++ `tidytext` allows text mining using 'dplyr', 'ggplot2', and other tidy tools;
++ `DT` provides an R interface to the JavaScript library DataTables.
+
+```{r load libraries, warning=FALSE, message=FALSE}
+library(tm)
+library(knitr)
+library(tidytext)
+library(tidyverse)
+library(DT)
+library(wordcloud2)
+library(scales)
+library(gridExtra)
+library(ngram)
+```
+
+### Step 1 - Load the data to be cleaned and processed
+
+```{r read data, warning=FALSE, message=FALSE}
+urlfile<-'https://raw.githubusercontent.com/rit-public/HappyDB/master/happydb/data/cleaned_hm.csv'
+hm_data <- read_csv(urlfile)
+```
+
+### Step 2 - Preliminary cleaning of text
+
+We clean the text by converting all the letters to the lower case, and removing punctuation, numbers, empty words and extra white space.
+
+```{r text processing in tm}
+corpus <- VCorpus(VectorSource(hm_data$cleaned_hm))%>%
+  tm_map(content_transformer(tolower))%>%
+  tm_map(removePunctuation)%>%
+  tm_map(removeNumbers)%>%
+  tm_map(removeWords, character(0))%>%
+  tm_map(stripWhitespace)
+```
+
+### Step 3 - Stemming words and converting tm object to tidy object
+
+Stemming reduces a word to its word *stem*. We stem the words here and then convert the "tm" object to a "tidy" object for much faster processing.
+
+```{r stemming}
+stemmed <- tm_map(corpus, stemDocument) %>%
+  tidy() %>%
+  select(text)
+```
+
+### Step 4 - Creating tidy format of the dictionary to be used for completing stems
+
+We also need a dictionary to look up the words corresponding to the stems.
+
+```{r tidy dictionary}
+dict <- tidy(corpus) %>%
+  select(text) %>%
+  unnest_tokens(dictionary, text)
+```
+
+### Step 5 - Removing stopwords that don't hold any significant information for our data set
+
+We remove stopwords provided by the "tidytext" package and also add custom stopwords in context of our data.
+
+```{r stopwords}
+data("stop_words")
+
+word <- c("happy","ago","yesterday","lot","today","months","month",
+                 "happier","happiest","last","week","past")
+
+stop_words <- stop_words %>%
+  bind_rows(mutate(tibble(word), lexicon = "updated"))
+```
+
+### Step 6 - Combining stems and dictionary into the same tibble
+
+Here we combine the stems and the dictionary into the same "tidy" object.
+
+```{r tidy stems with dictionary}
+completed <- stemmed %>%
+  mutate(id = row_number()) %>%
+  unnest_tokens(stems, text) %>%
+  bind_cols(dict) %>%
+  anti_join(stop_words, by = c("dictionary" = "word"))
+```
+
+### Step 7 - Stem completion
+
+Lastly, we complete the stems by picking the corresponding word with the highest frequency.
+
+```{r stem completion, warning=FALSE, message=FALSE}
+completed <- completed %>%
+  group_by(stems) %>%
+  count(dictionary) %>%
+  mutate(word = dictionary[which.max(n)]) %>%
+  ungroup() %>%
+  select(stems, word) %>%
+  distinct() %>%
+  right_join(completed) %>%
+  select(-stems)
+```
+
+### Step 8 - Pasting stem completed individual words into their respective happy moments
+
+We want our processed words to resemble the structure of the original happy moments. So we paste the words together to form happy moments.
+
+```{r reverse unnest}
+completed <- completed %>%
+  group_by(id) %>%
+  summarise(text = str_c(word, collapse = " ")) %>%
+  ungroup()
+```
+
+### Step 9 - Keeping a track of the happy moments with their own ID
+
+```{r cleaned hm_data, warning=FALSE, message=FALSE}
+hm_data <- hm_data %>%
+  mutate(id = row_number()) %>%
+  inner_join(completed)
+```
+
+### Exporting the processed text data into a CSV file
+
+```{r export data}
+write_csv(hm_data, "processed_moments.csv")
+```
+
+```{r load data, warning=FALSE, message=FALSE}
+hm_data <- read_csv("processed_moments.csv")
+
+urlfile<-'https://raw.githubusercontent.com/rit-public/HappyDB/master/happydb/data/demographic.csv'
+demo_data <- read_csv(urlfile)
+```
+
+### Combine both the data sets and keep the required columns for analysis
+
+We select a subset of the data that satisfies specific row conditions.
+
+```{r combining data, warning=FALSE, message=FALSE}
+hm_data <- hm_data %>%
+  inner_join(demo_data, by = "wid") %>%
+  select(wid,
+         original_hm,
+         gender, 
+         marital, 
+         parenthood,
+         reflection_period,
+         age, 
+         country, 
+         ground_truth_category, 
+         text) %>%
+  mutate(count = sapply(hm_data$text, wordcount)) %>%
+  filter(gender %in% c("m", "f")) %>%
+  filter(marital %in% c("single", "married")) %>%
+  filter(parenthood %in% c("n", "y")) %>%
+  filter(reflection_period %in% c("24h", "3m")) %>%
+  mutate(reflection_period = fct_recode(reflection_period, 
+                                        months_3 = "3m", hours_24 = "24h"))
+```
+
+
+### Create a bag of words using the text data
+
+```{r bag of words, warning=FALSE, message=FALSE}
+bag_of_words <-  hm_data %>%
+  unnest_tokens(word, text)
+
+word_count <- bag_of_words %>%
+  count(word, sort = TRUE)
+```
+
+### Create bigrams using the text data
+
+```{r bigram, warning=FALSE, message=FALSE}
+hm_bigrams <- hm_data %>%
+  filter(count != 1) %>%
+  unnest_tokens(bigram, text, token = "ngrams", n = 2)
+
+bigram_counts <- hm_bigrams %>%
+  separate(bigram, c("word1", "word2"), sep = " ") %>%
+  count(word1, word2, sort = TRUE)
+```
+
+```{r chart1, warning=FALSE, message=FALSE}
+# Word Frequency Bar Chart (Arranged from Highest to Lowest)
+word_count_plot <- word_count %>%
+  slice(1:10) %>%
+  ggplot(aes(x = reorder(word, n), y = n)) +  # Use reorder with -n to arrange in descending order
+  geom_col() +
+  xlab(NULL) +
+  ylab("Word Frequency") +
+  coord_flip() +
+  ggtitle("Top 10 Most Frequently Occuring Words")
+
+# Display the plot
+print(word_count_plot)
+```
+
+The word that appeared the most is "friend" with over ten thousand occurrences. This is followed by day, and then by time. The term "family" comes in fourth. The rest in the top 10 are the terms watched, home, played, feel, finally, and found.  
+
+
+```{r chart2, warning=FALSE, message=FALSE}
+# Create Age Groups
+hm_data <- hm_data %>%
+  mutate(age_group = case_when(
+    age < 35 ~ "Less than 35",
+    between(age, 35, 70) ~ "35 to 70",
+    age >= 70 ~ "70 and above"
+  ))
+
+# Words Most Associated with Each Age Group
+age_word_association_plot <- hm_data %>%
+  filter(!is.na(age_group)) %>%
+  unnest_tokens(word, text) %>%
+  count(age_group, word, sort = TRUE) %>%
+  group_by(age_group) %>%
+  top_n(10, n) %>%
+  ungroup() %>%
+  ggplot(aes(x = reorder(word, n), y = n, fill = age_group)) +
+  geom_col(position = "dodge") +
+  labs(title = "Words Most Associated with Age Groups",
+       x = "Word", y = "Count",
+       fill = "Age Group") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  facet_wrap(~age_group, scales = "free")
+
+# Display the plot
+print(age_word_association_plot)
+
+```
+
+The most frequently occurring words were also investigated per age group: less than 35 years old, 35 to 69 years old, and 70 years old and above. For all age group, the most frequently occurring words are friend, day, and time. The unique word that appeared only in the 34 years old and below age group is the term "played" which makes sense because this is the youngest age group and young people still find playing to be one of their enjoyable activities. The 35 to 69 years old age group is dominated by terms related to family such as "daughter", "wife", "son", and "family". Meanwhile, for the 70 and above years old age group, the unique terms are "favorite" and "morning". 
+
+
+```{r chart3, warning=FALSE, message=FALSE}
+# Filter data for the USA
+usa_data <- hm_data %>%
+  filter(country == "USA")
+
+# Top Words for USA
+top_words_usa_plot <- usa_data %>%
+  unnest_tokens(word, text) %>%
+  count(word, sort = TRUE) %>%
+  top_n(10, n) %>%
+  ggplot(aes(x = reorder(word, n), y = n, fill = word)) +
+  geom_col(position = "dodge") +
+  labs(title = "Top Words for USA",
+       x = "Word", y = "Count") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Display the plot
+print(top_words_usa_plot)
+
+```
+
+In the USA, the top words are friend, time, and day. Also in the top 10 are the words watched, played, finally, found, dinner, home, and night. It seems like the term "dinner" is an enjoyable moment for those in the USA since it is the unique term for this ocuntry not occurring in the top 10 words of the other three countries explored in this analysis. 
+
+```{r chart4, warning=FALSE, message=FALSE}
+# Filter data for India
+ind_data <- hm_data %>%
+  filter(country == "IND")
+
+# Top Words for India
+top_words_ind_plot <- ind_data %>%
+  unnest_tokens(word, text) %>%
+  count(word, sort = TRUE) %>%
+  top_n(10, n) %>%
+  ggplot(aes(x = reorder(word, n), y = n, fill = word)) +
+  geom_col(position = "dodge") +
+  labs(title = "Top Words for India",
+       x = "Word", y = "Count") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Display the plot
+print(top_words_ind_plot)
+
+```
+
+In India, the top three words are similar to USA: day, friend, and time. Although day in this case takes the top spot instead of friend. Birthday seems to be a term Indians frequently associate with happiness. Other terms in the top 10 are moment, life, family, feel, enjoyed, and home. 
+
+```{r chart5, warning=FALSE, message=FALSE}
+# Filter data for Canada
+can_data <- hm_data %>%
+  filter(country == "CAN")
+
+# Top Words for Canada
+top_words_can_plot <- can_data %>%
+  unnest_tokens(word, text) %>%
+  count(word, sort = TRUE) %>%
+  top_n(10, n) %>%
+  ggplot(aes(x = reorder(word, n), y = n, fill = word)) +
+  geom_col(position = "dodge") +
+  labs(title = "Top Words for Canada",
+       x = "Word", y = "Count") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Display the plot
+print(top_words_can_plot)
+
+
+```
+
+Canada's top 3 most frequently occurring terms are friend, time and game. Also in the top 10 are played, day, watched, son, home, enjoyed, and won. The terms game, played, won, enjoyed, and watched seem to be related to activities related to gaming or playing. This implies that Canadians might be inclined towards deriving happiness from gaming and playing. 
+
+
+```{r chart6, warning=FALSE, message=FALSE}
+# Filter data for Venezuela
+ven_data <- hm_data %>%
+  filter(country == "VEN")
+
+# Top Words for Venezuela
+top_words_ven_plot <- ven_data %>%
+  unnest_tokens(word, text) %>%
+  count(word, sort = TRUE) %>%
+  top_n(10, n) %>%
+  ggplot(aes(x = reorder(word, n), y = n, fill = word)) +
+  geom_col(position = "dodge") +
+  labs(title = "Top Words for Venezuela",
+       x = "Word", y = "Count") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Display the plot
+print(top_words_ven_plot)
+
+```
+
+For Venezuela, the top three terms are friend, family, and played. Also in the top 10 are day, girlfriend, time, buy, game, received, and favorite. It might be possible that Venezuelans, especially males, frequently get their happy moments with their girlfriends. 
+
+
+
+There seems to be an association between age group and terms associated with happiness. Younger people tend to associate happiness with playing and gaming. Middle aged individuals tend to associate happiness with family. And the older people tend to derive happiness from mornings and favoritisms. In the country-analysis done above, USA seems to be fond of dinners. Canadians are inclined towards playing and gaming. Indians are happy about birthdays. And, Venezuelans enjoy gaming and spending time with girlfriends. 
+
+
+
+References:
+Akari Asai, Sara Evensen, Behzad Golshan, Alon Halevy, Vivian Li, Andrei Lopatenko, 
+Daniela Stepanov, Yoshihiko Suhara, Wang-Chiew Tan, Yinzhan Xu, 
+``HappyDB: A Corpus of 100,000 Crowdsourced Happy Moments'', LREC '18, May 2018. (to appear)
